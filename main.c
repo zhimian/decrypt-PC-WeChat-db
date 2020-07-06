@@ -1,7 +1,15 @@
-#include<stdio.h>
+ï»¿#include<stdio.h>
+#include<Windows.h>
+#include <tchar.h>
+#include <psapi.h>
+#include <tlhelp32.h>
+#include<shlwapi.h>
 #include "crypto/pbkdf2_hmac.h"
 #include "crypto/sha.h"
 #include "crypto/aes.h"
+
+#pragma comment(lib,"shlwapi.lib")
+
 
 #undef _UNICODE
 #define SQLITE_FILE_HEADER "SQLite format 3" 
@@ -12,7 +20,7 @@
 #define SL3SIGNLEN 20
 
 #ifndef ANDROID_WECHAT
-//4048Êý¾Ý + 16IV + 20 HMAC + 12
+//4048æ•°æ® + 16IV + 20 HMAC + 12
 #define DEFAULT_PAGESIZE 4096      
 #define DEFAULT_ITER 64000
 #else
@@ -22,74 +30,262 @@
 #endif
 
 
-//pc¶ËÃÜÂëÊÇ¾­¹ýOllyDbgµÃµ½µÄ32Î»pass¡£
-BYTE pass[] = { 0x22,0xEB,0xED, 0xDD, 0x33, 0x27, 0x49, 0x3E,
-				0x8D, 0x5F,0x8B, 0xD7, 0xFF, 0x02, 0x3D, 0x23, 
-				0x5B, 0x0B, 0x53, 0xE6, 0x88, 0x7F, 0x43, 0x14,
-				0x9A, 0x06, 0x80, 0x94, 0x7E, 0x50, 0x98, 0xC9 };
-char dbfilename[50] = "ChatMsg.db";
-int Decryptdb();
+//for WeChat Version 2.8.0.121
+//å¯†é’¥æŒ‡é’ˆç›¸å¯¹äºŽWeChatWin.dllåŸºåœ°å€åç§»
+#define KEY_OFFSET  0x161cc50
+#define WXID_OFFSET 0x161cc78
 
-int main(int argc, char* argv[])
+char dbfilename[32] = "ChatMsg.db";
+
+BOOL Decryptdb(char *szFilePath, BYTE *pass);
+
+DWORD FindProcessId(const char *processname)
 {
-	/*
-	if (argc >= 2)    //µÚ¶þ¸ö²ÎÊýargv[1]ÊÇÎÄ¼þÃû
-		strcpy_s(dbfilename, argv[1]);  //¸´ÖÆ    
-										//Ã»ÓÐÌá¹©ÎÄ¼þÃû£¬ÔòÌáÊ¾ÓÃ»§ÊäÈë
-	else {
-		cout << "ÇëÊäÈëÎÄ¼þÃû:" << endl;
-		cin >> dbfilename;
-	}*/
-	//dbfilename = "ChatMsg.db";
-	Decryptdb();
+	HANDLE hProcessSnap;
+	PROCESSENTRY32 pe32;
+	DWORD result = NULL;
+
+	// Take a snapshot of all processes in the system.
+	hProcessSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (INVALID_HANDLE_VALUE == hProcessSnap) return(FALSE);
+
+	pe32.dwSize = sizeof(PROCESSENTRY32); // <----- IMPORTANT
+
+										  // Retrieve information about the first process,
+										  // and exit if unsuccessful
+	if (!Process32First(hProcessSnap, &pe32))
+	{
+		CloseHandle(hProcessSnap);          // clean the snapshot object
+		printf("!!! Failed to gather information on system processes! \n");
+		return(NULL);
+	}
+
+	do
+	{
+		//printf("Checking process %ls\n", pe32.szExeFile);
+		if (0 == strcmp(processname, pe32.szExeFile))
+		{
+			result = pe32.th32ProcessID;
+			break;
+		}
+	} while (Process32Next(hProcessSnap, &pe32));
+
+	CloseHandle(hProcessSnap);
+
+	return result;
+}
+
+DWORD FindProcess(char *szProcName) {
+	DWORD pid;
+
+	while (TRUE) {
+		pid = FindProcessId(szProcName);
+		if (pid)
+		{
+			return pid;
+		}
+		Sleep(500);
+	}
+
+}
+
+
+HMODULE GetModule(DWORD processID, TCHAR * szModuleName)
+{
+	HMODULE hMods[1024];
+	HANDLE hProcess;
+	DWORD cbNeeded;
+	unsigned int i;
+
+	// Get a handle to the process.
+	hProcess = OpenProcess(PROCESS_QUERY_INFORMATION |
+		PROCESS_VM_READ,
+		FALSE, processID);
+	if (NULL == hProcess)
+		return NULL;
+
+	// Get a list of all the modules in this process.
+	if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded))
+	{
+		for (i = 0; i < (cbNeeded / sizeof(HMODULE)); i++)
+		{
+			TCHAR szModName[MAX_PATH];
+
+			// Get the full path to the module's file.
+			if (GetModuleFileNameEx(hProcess, hMods[i], szModName,
+				sizeof(szModName) / sizeof(TCHAR)))
+			{
+				// Print the module name and handle value.	
+				PathStripPath(szModName);
+				if (!_tcscmp(szModName, szModuleName)) {
+					//_tprintf(TEXT("\t%s (0x%08X)\n"), szModName, hMods[i]);
+					CloseHandle(hProcess);
+					return hMods[i];
+				}
+			}
+		}
+	}
+
+	// Release the handle to the process.
+	CloseHandle(hProcess);
+
 	return 0;
 }
 
-size_t open_file(BYTE ** pDbBuffer) {
-	FILE* fpdb;
-	fopen_s(&fpdb, dbfilename, "rb+");
-	if (!fpdb)
+
+BOOL GetDatabaseKey(DWORD pid, LPVOID *buf) {
+	DWORD pKey = 0;
+
+	HMODULE pWeChatdll = GetModule(pid, "WeChatWin.dll");
+	if (!pWeChatdll)
 	{
-		printf("´ò¿ªÎÄ¼þ³ö´í!");
-		getchar();
+		printf("GetModule error!\n");
 		return 0;
 	}
 
-	fseek(fpdb, 0, SEEK_END);
-	size_t nFileSize = ftell(fpdb);
-	fseek(fpdb, 0, SEEK_SET);
+	HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+	ReadProcessMemory(hProcess, (DWORD)pWeChatdll + KEY_OFFSET, &pKey, 4, NULL);
+	ReadProcessMemory(hProcess, pKey, buf, 32, NULL);
+	CloseHandle(hProcess);
 
-	*pDbBuffer = (BYTE*)malloc(sizeof(BYTE)*nFileSize);
-	fread(*pDbBuffer, 1, nFileSize, fpdb);
-	fclose(fpdb);
-	return nFileSize;
+	if (!pKey) {
+		return 0;
+	}
+	return 1;
+}
+
+
+BOOL GetWeChatID(DWORD pid, char *szWXID)
+{
+	BYTE buffer[MAX_PATH];
+
+	HMODULE pWeChatdll = GetModule(pid, "WeChatWin.dll");
+	if (!pWeChatdll)
+	{
+		printf("GetModule error!\n");
+		return FALSE;
+	}
+	HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+	ReadProcessMemory(hProcess, (DWORD)pWeChatdll + WXID_OFFSET, &buffer, MAX_PATH, NULL);
+
+	size_t len = strlen(buffer);
+	if (len> MAX_PATH)
+	{
+		printf("get wechat id error!\n");
+		return 0;
+	}
+	strcpy_s(szWXID, MAX_PATH, buffer);
+	return TRUE;
+}
+
+
+int main(int argc, char* argv[])
+{
+	
+	printf("æ­£åœ¨æ£€æµ‹å¾®ä¿¡è¿›ç¨‹...\n");
+	DWORD pid = FindProcess("WeChat.exe");
+	printf("æ£€æµ‹åˆ°å¾®ä¿¡è¿è¡Œï¼\n");
+
+	BOOL bRet;
+	char szwxid[MAX_PATH] ;
+	
+	BOOL bRet = GetWeChatID(pid, szwxid);
+	if (!bRet)
+	{
+		getchar();
+		return 0;
+	}
+	printf("wxid:%s\n", szwxid);
+
+
+	char homePath[MAX_PATH] = { 0 };
+	DWORD dwPathSize = GetEnvironmentVariable("USERPROFILE", homePath, MAX_PATH);
+	if (dwPathSize == 0 || dwPathSize > MAX_PATH)
+	{
+		printf("get home path error!\n");
+		getchar();
+		return 0;
+	}
+	//printf("homepath:%s\n", homePath);
+
+	char szDBPath[MAX_PATH];
+	snprintf(szDBPath, MAX_PATH,
+		"%s\\Documents\\WeChat Files\\%s\\Msg\\%s", homePath, szwxid, dbfilename);
+	printf("DataBasePath:%s\n", szDBPath);
+
+
+	BYTE KeyBuffer[32];
+	bRet = GetDatabaseKey(pid, KeyBuffer);
+	if (!bRet)
+	{
+		printf("get key error!\n");
+		getchar();
+		return 0;
+	}
+	//for (int i = 0; i < 32; i++) {
+	//	printf("%02x", KeyBuffer[i]);
+	//}
+	
+	Decryptdb(szDBPath, KeyBuffer);
+	return 0;
+}
+//æ‰“å¼€dbæ–‡ä»¶
+size_t OpenDBFile(char *szFilePath,BYTE ** pDbBuffer) {
+
+	DWORD RSize;
+	HANDLE hFile = CreateFile(szFilePath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+	if (hFile == INVALID_HANDLE_VALUE)
+	{
+		printf("open datebase file error! %d \n",GetLastError());
+		return 0;
+	}
+
+	DWORD dwFileSize = GetFileSize(hFile, NULL);
+	*pDbBuffer = (BYTE*)malloc(sizeof(BYTE)*dwFileSize);
+
+
+	ReadFile(hFile, *pDbBuffer, dwFileSize, &RSize, NULL);
+	if (dwFileSize != RSize)
+	{
+		printf("read file error!\n");
+		return 0;
+	}
+	CloseHandle(hFile);   
+	return dwFileSize;
+
 };
 
-int Decryptdb()
+BOOL Decryptdb(char *szFilePath,BYTE *pass)
 {
 	BYTE* pDbBuffer = NULL;
-	size_t nFileSize = open_file(&pDbBuffer);
-	
+	size_t nFileSize = OpenDBFile(szFilePath,&pDbBuffer);
+	if (!nFileSize) {
+		return 0;
+	}
 
+	//æ•°æ®åº“æ–‡ä»¶å‰16å­—èŠ‚ä¸ºç›å€¼
 	BYTE salt[16] = { 0 };
 	memcpy(salt, pDbBuffer, 16);
 
 #ifndef NO_USE_HMAC_SHA1
+	//HMACéªŒè¯ç”¨çš„ç›å€¼éœ€è¦å¼‚æˆ–0x3a
 	BYTE mac_salt[16] = { 0 };
 	memcpy(mac_salt, salt, 16);
 	for (int i = 0; i < sizeof(salt); i++)
 		mac_salt[i] ^= 0x3a;
 #endif
 
-	int reserve = IV_SIZE;      //Ð£ÑéÂë³¤¶È,PC¶ËÃ¿4KBÓÐ48B
+	//ä¿ç•™æ®µé•¿åº¦,PCç«¯æ¯4KBæœ‰48B
+	int reserve = IV_SIZE;     
 #ifndef NO_USE_HMAC_SHA1
 	reserve += HMAC_SHA1_SIZE;
 #endif
 	reserve = ((reserve % AES_BLOCK_SIZE) == 0) ? reserve : ((reserve / AES_BLOCK_SIZE) + 1) * AES_BLOCK_SIZE;
 
+	//å¯†é’¥æ‰©å±•ï¼Œåˆ†åˆ«å¯¹åº”AESè§£å¯†å¯†é’¥å’ŒHMACéªŒè¯å¯†é’¥
 	BYTE key[KEY_SIZE] = { 0 };
 	BYTE mac_key[KEY_SIZE] = { 0 };
-	PKCS5_PBKDF2_HMAC((const BYTE*)pass, sizeof(pass), 
+	PKCS5_PBKDF2_HMAC((const BYTE*)pass, 32, 
 		salt, sizeof(salt), DEFAULT_ITER, sizeof(key), key);
 #ifndef NO_USE_HMAC_SHA1
 	PKCS5_PBKDF2_HMAC((const BYTE*)key, sizeof(key), 
@@ -100,10 +296,12 @@ int Decryptdb()
 	BYTE pDecryptPerPageBuffer[DEFAULT_PAGESIZE];
 	int nPage = 1;
 	int offset = 16;
+	printf("\n å¼€å§‹è§£å¯† \n");
 	while (pTemp < pDbBuffer + nFileSize)
 	{
-		printf("½âÃÜÊý¾ÝÒ³:%d/%d \n", nPage, nFileSize / DEFAULT_PAGESIZE);
-
+		printf("è§£å¯†æ•°æ®é¡µ:%d/%d \n", nPage, nFileSize / DEFAULT_PAGESIZE);
+		
+		//è®¡ç®—åŠ å¯†æ•°æ®çš„HMACï¼Œå¹¶ä¸Žä¿ç•™å­—æ®µä¸­çš„å€¼è¿›è¡Œæ¯”è¾ƒ
 #ifndef NO_USE_HMAC_SHA1
 		BYTE hash_mac[HMAC_SHA1_SIZE] = { 0 };
 		sha1_context hctx;
@@ -115,7 +313,7 @@ int Decryptdb()
 		BYTE* pHMAC = pTemp + DEFAULT_PAGESIZE - reserve + IV_SIZE;
 		if (0 != memcmp(hash_mac, pHMAC, sizeof(hash_mac)))
 		{
-			printf("\n ¹þÏ£Öµ´íÎó! \n");
+			printf("\n å“ˆå¸Œå€¼é”™è¯¯! \n");
 			getchar();
 			return 0;
 		}
@@ -124,6 +322,7 @@ int Decryptdb()
 		if (nPage == 1)
 			memcpy(pDecryptPerPageBuffer, SQLITE_FILE_HEADER, offset);
 
+		//AESè§£å¯†æ“ä½œ
 		BYTE key_schedule[40];
 		aes_key_setup(key, key_schedule, 256);
 		aes_decrypt_cbc(
@@ -138,19 +337,22 @@ int Decryptdb()
 			pTemp + DEFAULT_PAGESIZE - reserve, 
 			reserve);
 		
+		//å°†è§£å¯†åŽçš„æ•°æ®å†™å…¥åˆ°æ–‡ä»¶ä¸­
 		char decFile[1024] = { 0 };
-		sprintf_s(decFile, 1024,"dec_%s", dbfilename);
+		sprintf_s(decFile, 1024, "dec_%s", dbfilename);
+		
 		FILE * fp;
 		fopen_s(&fp, decFile, "ab+");
 		fwrite(pDecryptPerPageBuffer, 1, DEFAULT_PAGESIZE, fp);
 		fclose(fp);
 		
-
 		nPage++;
 		offset = 0;
 		pTemp += DEFAULT_PAGESIZE;
 	}
-	printf("\n ½âÃÜ³É¹¦! \n");
+	printf("\n è§£å¯†æˆåŠŸ! \n");
+	printf("\n dec_%sæ–‡ä»¶å¯ç”¨navicatä¹‹ç±»çš„è½¯ä»¶è¯»å–ï¼ \n", dbfilename);
+
 	getchar();
-	return 0;
+	return TRUE;
 }

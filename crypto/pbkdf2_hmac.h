@@ -1,3 +1,4 @@
+#include<stdio.h>
 #include "sha.h"
 #ifndef _CIPHER_PKCS5_PBKDF2_HMAC_H
 #define _CIPHER_PKCS5_PBKDF2_HMAC_H
